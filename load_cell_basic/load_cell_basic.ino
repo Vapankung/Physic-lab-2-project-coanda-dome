@@ -1,67 +1,295 @@
 #include "HX711.h"
+#include <BluetoothSerial.h>
 
+BluetoothSerial SerialBT;
 HX711 scale;
 
+// =========================
+// Pin setup
+// =========================
 const byte DOUT_PIN = 25;
 const byte SCK_PIN  = 26;
 
-const float KNOWN_WEIGHT_GRAMS = 244;  // <-- change this
+// =========================
+// Globals
+// =========================
+float calibrationFactor = 1.0;   // counts per gram
+bool isTared = false;
+bool isCalibrated = false;
+bool continuousRead = true;
 
-float calibrationFactor = 1.0;
+String serialBuffer = "";
+String btBuffer = "";
 
-void setup() {
-  Serial.begin(9600);
-  scale.begin(DOUT_PIN, SCK_PIN);
-
-  Serial.println("\n=== HX711 Calibration ===");
-  Serial.println("1) Remove all weight.");
-  delay(3000);
-
-  // Tare
-  scale.tare(500);  // average 15 readings
-  long offset = scale.get_offset();
-  Serial.print("Offset (tare): ");
-  Serial.println(offset);
-
-  Serial.println("\n2) Put the KNOWN weight on the load cell now.");
-  Serial.print("Known weight (g): ");
-  Serial.println(KNOWN_WEIGHT_GRAMS);
-  delay(5000);
-
-  // Read average raw value with known weight
-  long rawWithWeight = scale.read_average(500); // average 20 readings
-  Serial.print("Raw with known weight: ");
-  Serial.println(rawWithWeight);
-
-  // After tare, the “net raw” is basically (rawWithWeight - offset)
-  long netRaw = rawWithWeight - offset;
-  Serial.print("Net raw (raw - offset): ");
-  Serial.println(netRaw);
-
-  // Compute calibration factor (raw counts per gram)
-  calibrationFactor = (float)netRaw / KNOWN_WEIGHT_GRAMS;
-  Serial.print("\n✅ Calibration factor (counts per gram): ");
-  Serial.println(calibrationFactor, 6);
-
-  Serial.println("\nNow reading weight...");
+// =========================
+// Helper print functions
+// =========================
+void dualPrint(const String &msg) {
+  Serial.print(msg);
+  SerialBT.print(msg);
 }
 
-void loop() {
+void dualPrintln(const String &msg) {
+  Serial.println(msg);
+  SerialBT.println(msg);
+}
+
+// =========================
+// Read stable average raw
+// =========================
+long getStableRaw(int samples = 30, int delayMs = 5) {
+  long sum = 0;
+  int count = 0;
+
+  for (int i = 0; i < samples; i++) {
+    if (scale.is_ready()) {
+      sum += scale.read();
+      count++;
+    }
+    delay(delayMs);
+  }
+
+  if (count == 0) return 0;
+  return sum / count;
+}
+
+// =========================
+// Command handlers
+// =========================
+void printHelp() {
+  dualPrintln("");
+  dualPrintln("=== COMMANDS ===");
+  dualPrintln("HELP       -> show commands");
+  dualPrintln("TARE       -> tare with no load");
+  dualPrintln("CAL=100    -> calibrate using 100 g known weight");
+  dualPrintln("STATUS     -> show current status");
+  dualPrintln("READON     -> start continuous reading");
+  dualPrintln("READOFF    -> stop continuous reading");
+  dualPrintln("");
+  dualPrintln("How to calibrate:");
+  dualPrintln("1) Remove all weight");
+  dualPrintln("2) Send: TARE");
+  dualPrintln("3) Put known weight");
+  dualPrintln("4) Send: CAL=your_weight_in_grams");
+  dualPrintln("");
+}
+
+void printStatus() {
+  dualPrintln("");
+  dualPrintln("=== STATUS ===");
+  dualPrint("HX711 ready: ");
+  dualPrintln(scale.is_ready() ? "YES" : "NO");
+
+  dualPrint("Tared: ");
+  dualPrintln(isTared ? "YES" : "NO");
+
+  dualPrint("Calibrated: ");
+  dualPrintln(isCalibrated ? "YES" : "NO");
+
+  dualPrint("Offset: ");
+  dualPrintln(String(scale.get_offset()));
+
+  dualPrint("Calibration factor (counts/gram): ");
+  dualPrintln(String(calibrationFactor, 6));
+
+  dualPrint("Continuous read: ");
+  dualPrintln(continuousRead ? "ON" : "OFF");
+  dualPrintln("");
+}
+
+void doTare() {
   if (!scale.is_ready()) {
-    Serial.println("HX711 not ready");
-    delay(500);
+    dualPrintln("ERROR: HX711 not ready");
     return;
   }
 
-  long raw = scale.read_average(10);
+  dualPrintln("");
+  dualPrintln("Taring... remove all weight now.");
+  delay(1000);
+
+  long offset = getStableRaw(80, 5);
+  scale.set_offset(offset);
+
+  isTared = true;
+
+  dualPrint("Tare complete. Offset = ");
+  dualPrintln(String(offset));
+  dualPrintln("");
+}
+
+void doCalibrate(float knownWeight) {
+  if (!scale.is_ready()) {
+    dualPrintln("ERROR: HX711 not ready");
+    return;
+  }
+
+  if (!isTared) {
+    dualPrintln("ERROR: Please tare first using TARE");
+    return;
+  }
+
+  if (knownWeight <= 0.0f) {
+    dualPrintln("ERROR: Weight must be greater than 0");
+    return;
+  }
+
+  dualPrintln("");
+  dualPrint("Calibrating with known weight = ");
+  dualPrint( String(knownWeight, 3) );
+  dualPrintln(" g");
+  dualPrintln("Make sure the weight is already placed on the load cell.");
+  delay(1500);
+
+  long rawWithWeight = getStableRaw(100, 5);
   long offset = scale.get_offset();
+  long netRaw = rawWithWeight - offset;
 
-  float grams = (raw - offset) / calibrationFactor;
+  if (netRaw == 0) {
+    dualPrintln("ERROR: Net raw is zero. Calibration failed.");
+    return;
+  }
 
-  Serial.print("RAW: ");
-  Serial.print(raw);
-  Serial.print(" | grams: ");
-  Serial.println(grams, 2);
+  calibrationFactor = (float)netRaw / knownWeight;
+  isCalibrated = true;
 
-  delay(300);
+  dualPrint("Raw with weight: ");
+  dualPrintln(String(rawWithWeight));
+
+  dualPrint("Offset: ");
+  dualPrintln(String(offset));
+
+  dualPrint("Net raw: ");
+  dualPrintln(String(netRaw));
+
+  dualPrint("New calibration factor (counts/gram): ");
+  dualPrintln(String(calibrationFactor, 6));
+  dualPrintln("Calibration complete.");
+  dualPrintln("");
+}
+
+void processCommand(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
+
+  if (cmd.length() == 0) return;
+
+  dualPrint("Received command: ");
+  dualPrintln(cmd);
+
+  if (cmd == "HELP") {
+    printHelp();
+  }
+  else if (cmd == "TARE") {
+    doTare();
+  }
+  else if (cmd.startsWith("CAL=")) {
+    String val = cmd.substring(4);
+    float knownWeight = val.toFloat();
+    doCalibrate(knownWeight);
+  }
+  else if (cmd == "STATUS") {
+    printStatus();
+  }
+  else if (cmd == "READON") {
+    continuousRead = true;
+    dualPrintln("Continuous reading: ON");
+  }
+  else if (cmd == "READOFF") {
+    continuousRead = false;
+    dualPrintln("Continuous reading: OFF");
+  }
+  else {
+    dualPrintln("Unknown command. Type HELP");
+  }
+}
+
+// =========================
+// Read commands from Serial
+// =========================
+void readSerialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      if (serialBuffer.length() > 0) {
+        processCommand(serialBuffer);
+        serialBuffer = "";
+      }
+    } else {
+      serialBuffer += c;
+    }
+  }
+}
+
+// =========================
+// Read commands from Bluetooth
+// =========================
+void readBluetoothCommands() {
+  while (SerialBT.available()) {
+    char c = SerialBT.read();
+
+    if (c == '\n' || c == '\r') {
+      if (btBuffer.length() > 0) {
+        processCommand(btBuffer);
+        btBuffer = "";
+      }
+    } else {
+      btBuffer += c;
+    }
+  }
+}
+
+// =========================
+// Setup
+// =========================
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin("ESP32_LoadCell");
+
+  scale.begin(DOUT_PIN, SCK_PIN);
+
+  dualPrintln("");
+  dualPrintln("=== ESP32 HX711 Bluetooth Load Cell ===");
+  dualPrintln("Bluetooth device name: ESP32_LoadCell");
+
+  if (scale.is_ready()) {
+    dualPrintln("HX711 is ready.");
+  } else {
+    dualPrintln("WARNING: HX711 not ready.");
+  }
+
+  printHelp();
+}
+
+// =========================
+// Main loop
+// =========================
+void loop() {
+  readSerialCommands();
+  readBluetoothCommands();
+
+  static unsigned long lastRead = 0;
+
+  if (continuousRead && millis() - lastRead >= 500) {
+    lastRead = millis();
+
+    if (!scale.is_ready()) {
+      dualPrintln("HX711 not ready");
+      return;
+    }
+
+    long raw = getStableRaw(10, 2);
+    long offset = scale.get_offset();
+
+    dualPrint("RAW: ");
+    dualPrint(raw >= 0 ? String(raw) : String(raw));
+    
+    if (isCalibrated && calibrationFactor != 0.0f) {
+      float grams = (raw - offset) / calibrationFactor;
+      dualPrint(" | grams: ");
+      dualPrintln(String(grams, 2));
+    } else {
+      dualPrintln(" | grams: not calibrated");
+    }
+  }
 }
