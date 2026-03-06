@@ -228,192 +228,48 @@ void calibrateScaleAccurate() {
 
   long rawWithWeight = readTrimmedMean(ACCURATE_SAMPLES, 5);
   long offset = scale.get_offset();
-  long netRaw = rawWithWeight - offset;
-
-  calibrationFactor = (float)netRaw / knownWeightGrams;
-
-  if (calibrationFactor == 0.0) {
-    Serial.println(F("ERROR: Calibration failed. Factor = 0."));
-    calibrated = false;
-    return;
-  }
-
-  calibrated = true;
-  smoothedValid = false;
-
-  Serial.print(F("Raw with weight: "));
-  Serial.println(rawWithWeight);
-
-  Serial.print(F("Offset: "));
+  Serial.print("Offset (tare): ");
   Serial.println(offset);
 
-  Serial.print(F("Net raw: "));
+  Serial.println("\n2) Put the KNOWN weight on the load cell now.");
+  Serial.print("Known weight (g): ");
+  Serial.println(KNOWN_WEIGHT_GRAMS);
+  delay(5000);
+
+  // Read average raw value with known weight
+  long rawWithWeight = scale.read_average(500); // average 20 readings
+  Serial.print("Raw with known weight: ");
+  Serial.println(rawWithWeight);
+
+  // After tare, the “net raw” is basically (rawWithWeight - offset)
+  long netRaw = rawWithWeight - offset;
+  Serial.print("Net raw (raw - offset): ");
   Serial.println(netRaw);
 
-  Serial.print(F("Calibration factor (counts/g): "));
+  // Compute calibration factor (raw counts per gram)
+  calibrationFactor = (float)netRaw / KNOWN_WEIGHT_GRAMS;
+  Serial.print("\n✅ Calibration factor (counts per gram): ");
   Serial.println(calibrationFactor, 6);
 
-  Serial.println(F("Calibration complete."));
-}
-
-// --------------------------------------------------
-// Single read
-// --------------------------------------------------
-void readWeightOnce() {
-  if (!scale.is_ready()) {
-    Serial.println(F("HX711 not ready"));
-    return;
-  }
-
-  if (!tareDone) {
-    Serial.println(F("Please run 'tare' first."));
-    return;
-  }
-
-  long raw = readTrimmedMean(FAST_SAMPLES, 3);
-
-  Serial.print(F("RAW: "));
-  Serial.print(raw);
-
-  if (calibrated && calibrationFactor != 0.0) {
-    float grams = getFilteredWeightGrams();
-    Serial.print(F(" | grams: "));
-    Serial.println(grams, 3);
-  } else {
-    Serial.println(F(" | grams: not calibrated"));
-  }
-}
-
-void readRawOnce() {
-  if (!scale.is_ready()) {
-    Serial.println(F("HX711 not ready"));
-    return;
-  }
-
-  long raw = readTrimmedMean(FAST_SAMPLES, 3);
-  Serial.print(F("Trimmed RAW: "));
-  Serial.println(raw);
-}
-
-// --------------------------------------------------
-// Commands
-// --------------------------------------------------
-void processCommand(String cmd) {
-  cmd.trim();
-  cmd.toLowerCase();
-
-  if (cmd.length() == 0) return;
-
-  Serial.print(F("Received command: "));
-  Serial.println(cmd);
-
-  if (cmd == "help") {
-    printHelp();
-  }
-  else if (cmd == "tare") {
-    tareScaleAccurate();
-  }
-  else if (cmd == "cal") {
-    calibrateScaleAccurate();
-  }
-  else if (cmd.startsWith("weight=")) {
-    String valueStr = cmd.substring(7);
-    float value = valueStr.toFloat();
-
-    if (value <= 0) {
-      Serial.println(F("ERROR: weight must be > 0"));
-    } else {
-      knownWeightGrams = value;
-      Serial.print(F("Known weight set to "));
-      Serial.print(knownWeightGrams, 3);
-      Serial.println(F(" g"));
-    }
-  }
-  else if (cmd == "read") {
-    readWeightOnce();
-  }
-  else if (cmd == "raw") {
-    readRawOnce();
-  }
-  else if (cmd == "stable") {
-    if (isScaleStable()) {
-      Serial.println(F("Scale is stable."));
-    } else {
-      Serial.println(F("Scale is not stable."));
-    }
-  }
-  else if (cmd == "start") {
-    if (!calibrated) {
-      Serial.println(F("Please calibrate first."));
-      return;
-    }
-    continuousRead = true;
-    Serial.println(F("Continuous reading started."));
-  }
-  else if (cmd == "stop") {
-    continuousRead = false;
-    Serial.println(F("Continuous reading stopped."));
-  }
-  else if (cmd == "status") {
-    printStatus();
-  }
-  else {
-    Serial.println(F("Unknown command."));
-    printHelp();
-  }
-}
-
-// --------------------------------------------------
-// Serial input
-// --------------------------------------------------
-void readSerialCommands() {
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-
-    if (c == '\n' || c == '\r') {
-      if (inputBuffer.length() > 0) {
-        processCommand(inputBuffer);
-        inputBuffer = "";
-      }
-    } else {
-      inputBuffer += c;
-    }
-  }
-}
-
-// --------------------------------------------------
-// Setup / Loop
-// --------------------------------------------------
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-
-  Serial.println(F("\n=== HX711 High Accuracy Serial Control ==="));
-
-  scale.begin(DOUT_PIN, SCK_PIN);
-
-  if (scale.is_ready()) {
-    Serial.println(F("HX711 is ready."));
-  } else {
-    Serial.println(F("WARNING: HX711 not ready. Check wiring."));
-  }
-
-  Serial.println(F("\nRecommended process:"));
-  Serial.println(F("1) Remove all weight"));
-  Serial.println(F("2) Type: tare"));
-  Serial.println(F("3) Put known weight on load cell"));
-  Serial.println(F("4) Type: weight=100   (or your real weight)"));
-  Serial.println(F("5) Type: cal"));
-  Serial.println(F("6) Type: read or start"));
-
-  printHelp();
+  Serial.println("\nNow reading weight...");
 }
 
 void loop() {
-  readSerialCommands();
-
-  if (continuousRead) {
-    readWeightOnce();
-    delay(250);
+  if (!scale.is_ready()) {
+    Serial.println("HX711 not ready");
+    delay(500);
+    return;
   }
+
+  long raw = scale.read_average(10);
+  long offset = scale.get_offset();
+
+  float grams = (raw - offset) / calibrationFactor;
+
+  Serial.print("RAW: ");
+  Serial.print(raw);
+  Serial.print(" | grams: ");
+  Serial.println(grams, 2);
+
+  delay(300);
 }
