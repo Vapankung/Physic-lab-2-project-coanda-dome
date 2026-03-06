@@ -3,8 +3,8 @@
 HX711 scale;
 
 // ===== Pins for Arduino Uno =====
-const byte DOUT_PIN = 3;
-const byte SCK_PIN  = 2;
+const byte DOUT_PIN = 25;
+const byte SCK_PIN  = 26;
 
 // ===== Calibration =====
 float knownWeightGrams = 100.0;     // change when needed
