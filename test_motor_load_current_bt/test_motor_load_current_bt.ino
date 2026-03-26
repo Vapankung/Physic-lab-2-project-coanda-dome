@@ -14,13 +14,14 @@ static const int ESC_PIN = 27;
 static const int MIN_US = 1000;
 static const int MAX_US = 2000;
 
-static const float MAX_LIMIT = 0.30f;
-static const unsigned long FAILSAFE_MS = 10000;
+static const float MAX_LIMIT = 0.70f;
+static const unsigned long FAILSAFE_MS = 30 * 1000;
 static const unsigned long ARM_MIN_HOLD_MS = 2000;
 
 static bool motorEnabled = false;
 static int requestedPercent = 0;
 static unsigned long lastMotorCmdMs = 0;
+static bool failsafeActive = false;
 
 // ===================== CURRENT SENSOR SETTINGS =====================
 static const int PIN_ADC = 34;
@@ -109,6 +110,7 @@ void clearLog() {
 
 void dumpLogToBT() {
   motorEnabled = false;
+  requestedPercent = 0;
   esc.writeMicroseconds(MIN_US);
 
   File f = SPIFFS.open(LOG_PATH, FILE_READ);
@@ -148,7 +150,7 @@ void setThrottlePercent(int percent0to100) {
 
   dualPrint("OK Throttle=");
   dualPrint(String(requestedPercent));
-  dualPrint("% (capped 30%) pulse=");
+  dualPrint("% (capped 70%) pulse=");
   dualPrint(String(us));
   dualPrintln("us");
 }
@@ -168,7 +170,7 @@ void printMotorStatus() {
   dualPrint(String(requestedPercent));
   dualPrint("% | PULSE=");
   dualPrint(String(us));
-  dualPrintln("us (capped 30%)");
+  dualPrintln("us (capped 70%)");
 }
 
 // ===================== HX711 HELPERS =====================
@@ -353,6 +355,7 @@ void handleCommand(String cmd) {
   // -------- Motor --------
   if (up == "ON") {
     motorEnabled = true;
+    failsafeActive = false;
     lastMotorCmdMs = millis();
     setThrottlePercent(0);
     armSequence();
@@ -362,6 +365,7 @@ void handleCommand(String cmd) {
 
   if (up == "OFF") {
     motorEnabled = false;
+    failsafeActive = false;
     setThrottlePercent(0);
     dualPrintln("OK OFF (motor disabled, throttle MIN)");
     return;
@@ -372,12 +376,14 @@ void handleCommand(String cmd) {
     dualPrintln(String("LOGGING=") + (logEnabled ? "ON" : "OFF") +
                 " | RATE=" + String(logIntervalMs) + "ms | SENS=" + String(SENS_V_PER_A, 5));
     dualPrintln(String("ZERO=") + (zeroDone ? "DONE" : "CAL") + " | zeroRaw=" + String(zeroRaw, 1));
+    dualPrintln(String("FAILSAFE=") + (failsafeActive ? "ACTIVE" : "NORMAL"));
     return;
   }
 
   if (up == "STOP") {
     if (motorEnabled) {
       lastMotorCmdMs = millis();
+      failsafeActive = false;
       setThrottlePercent(0);
     } else {
       logEnabled = false;
@@ -401,6 +407,7 @@ void handleCommand(String cmd) {
     int val = cmd.substring(spaceIdx + 1).toInt();
     val = constrain(val, 0, 100);
     lastMotorCmdMs = millis();
+    failsafeActive = false;
     setThrottlePercent(val);
     return;
   }
@@ -573,6 +580,16 @@ void loop() {
   if (motorEnabled) {
     if (millis() - lastMotorCmdMs > FAILSAFE_MS) {
       esc.writeMicroseconds(MIN_US);
+      motorEnabled = false;
+      requestedPercent = 0;
+
+      if (!failsafeActive) {
+        dualPrintln("⚠️ FAILSAFE at ms=" + String(millis()));
+        dualPrintln("Motor disabled due to command timeout.");
+        failsafeActive = true;
+      }
+    } else {
+      failsafeActive = false;
     }
   } else {
     esc.writeMicroseconds(MIN_US);
