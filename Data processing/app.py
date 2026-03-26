@@ -12,6 +12,7 @@ import pandas as pd
 import serial
 import serial.tools.list_ports
 
+
 # ===================== CONFIG & STATE =====================
 MAX_POINTS = 500
 MAX_LOG_LINES = 200
@@ -28,21 +29,27 @@ log_lock = threading.Lock()
 serial_lock = threading.Lock()
 file_lock = threading.Lock()
 state_lock = threading.Lock()
+run_lock = threading.Lock()
 
-motor_status = "OFF"      # OFF / ON
+motor_status = "OFF"      # OFF / ON / RUN xx%
 connection_status_text = "Disconnected"
+connection_started_dt = None
 
 # Logging files
 SESSION_FOLDER = None
 TXT_LOG_PATH = None
 CSV_LOG_PATH = None
 
+# Run tracking
+run_history = []
+current_run = None
+run_counter = 0
+motor_enabled_state = False
+commanded_speed_percent = 0
+
 
 # ===================== FILE / LOG HELPERS =====================
 def make_session_files():
-    """
-    Create a fresh logging folder and files for this app run.
-    """
     global SESSION_FOLDER, TXT_LOG_PATH, CSV_LOG_PATH
 
     now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -62,17 +69,11 @@ def make_session_files():
 
 
 def add_log(message: str):
-    """
-    Add a message to the on-screen console log buffer.
-    """
     with log_lock:
         log_buffer.append(message)
 
 
 def write_txt_log(tag: str, message: str):
-    """
-    Write any serial/system event to the TXT log file.
-    """
     if not TXT_LOG_PATH:
         return
 
@@ -85,9 +86,6 @@ def write_txt_log(tag: str, message: str):
 
 
 def write_csv_row(ms, time_s, current_a, thrust_g, raw_line):
-    """
-    Write parsed telemetry to CSV.
-    """
     if not CSV_LOG_PATH:
         return
 
@@ -106,14 +104,16 @@ def get_available_ports():
 def make_empty_figure(title: str):
     fig = go.Figure()
     fig.update_layout(
-        title=title,
+        title=dict(text=title, font=dict(color="white")),
         margin=dict(l=20, r=20, t=40, b=30),
         height=320,
-        template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         xaxis_title="Time (s)",
         yaxis_title=title,
+        font=dict(color="#e0e0e0"),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.1)", zerolinecolor="rgba(255,255,255,0.1)"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.1)", zerolinecolor="rgba(255,255,255,0.1)"),
     )
     return fig
 
@@ -140,11 +140,209 @@ def get_connection_status():
         return connection_status_text
 
 
+def format_elapsed_seconds(total_seconds):
+    if total_seconds is None or total_seconds < 0:
+        return "00:00:00"
+
+    total_seconds = int(total_seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def get_connection_elapsed_str():
+    with state_lock:
+        if connection_started_dt is None:
+            return "00:00:00"
+        return format_elapsed_seconds((datetime.now() - connection_started_dt).total_seconds())
+
+
+def get_active_run_elapsed_str():
+    with run_lock:
+        if current_run is None:
+            return "00:00:00"
+        return format_elapsed_seconds((datetime.now() - current_run["start_dt"]).total_seconds())
+
+
+# ===================== RUN TRACKING HELPERS =====================
+def fmt_dt(dt_obj):
+    return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def finalize_current_run(reason: str):
+    global current_run
+
+    with run_lock:
+        if current_run is None:
+            return
+
+        end_dt = datetime.now()
+        samples = current_run["samples"]
+        thrust_samples = current_run["thrust_samples"]
+        ratio_samples = current_run["ratio_samples"]
+
+        avg_current = (current_run["current_sum"] / samples) if samples > 0 else None
+        avg_thrust = (current_run["thrust_sum"] / thrust_samples) if thrust_samples > 0 else None
+        avg_ratio = (current_run["ratio_sum"] / ratio_samples) if ratio_samples > 0 else None
+
+        run_history.append(
+            {
+                "run_id": current_run["run_id"],
+                "status": "Completed",
+                "start_time": current_run["start_time"],
+                "start_cmd": current_run["start_cmd"],
+                "end_time": fmt_dt(end_dt),
+                "end_reason": reason,
+                "duration_s": (end_dt - current_run["start_dt"]).total_seconds(),
+                "samples": samples,
+                "avg_current": avg_current,
+                "avg_thrust": avg_thrust,
+                "avg_ratio": avg_ratio,
+            }
+        )
+
+        current_run = None
+
+
+def start_new_run(trigger_cmd: str):
+    global current_run, run_counter
+
+    with run_lock:
+        if current_run is not None:
+            return
+
+        run_counter += 1
+        now_dt = datetime.now()
+        current_run = {
+            "run_id": run_counter,
+            "start_dt": now_dt,
+            "start_time": fmt_dt(now_dt),
+            "start_cmd": trigger_cmd,
+            "samples": 0,
+            "current_sum": 0.0,
+            "thrust_sum": 0.0,
+            "ratio_sum": 0.0,
+            "thrust_samples": 0,
+            "ratio_samples": 0,
+        }
+
+
+def update_run_metrics(current_a, thrust_g):
+    with run_lock:
+        if current_run is None:
+            return
+
+        current_run["samples"] += 1
+        current_run["current_sum"] += current_a
+
+        if thrust_g is not None:
+            current_run["thrust_sum"] += thrust_g
+            current_run["thrust_samples"] += 1
+
+            if current_a > 0:
+                current_run["ratio_sum"] += (thrust_g / current_a)
+                current_run["ratio_samples"] += 1
+
+
+def parse_speed_percent(cmd: str):
+    parts = cmd.strip().split(maxsplit=1)
+    if len(parts) != 2 or parts[0].upper() != "SPEED":
+        return None
+
+    try:
+        value = int(float(parts[1].strip()))
+    except ValueError:
+        return None
+
+    return max(0, min(100, value))
+
+
+def track_command_for_runs(cmd: str):
+    global motor_enabled_state, commanded_speed_percent
+
+    cleaned = cmd.strip()
+    upper = cleaned.upper()
+
+    if upper == "ON":
+        motor_enabled_state = True
+        commanded_speed_percent = 0
+        return
+
+    if upper == "OFF":
+        motor_enabled_state = False
+        commanded_speed_percent = 0
+        finalize_current_run("OFF")
+        return
+
+    if upper == "STOP":
+        if motor_enabled_state:
+            commanded_speed_percent = 0
+            finalize_current_run("STOP")
+        return
+
+    speed_val = parse_speed_percent(cleaned)
+    if speed_val is None:
+        return
+
+    if not motor_enabled_state:
+        return
+
+    commanded_speed_percent = speed_val
+
+    if speed_val > 0:
+        if current_run is None:
+            start_new_run(f"SPEED {speed_val}")
+    else:
+        finalize_current_run("SPEED 0")
+
+
+def build_run_snapshot(run_dict: dict, status: str = "Completed"):
+    return {
+        "run_id": run_dict["run_id"],
+        "status": status,
+        "start_time": run_dict["start_time"],
+        "start_cmd": run_dict["start_cmd"],
+        "end_time": run_dict.get("end_time", "-"),
+        "end_reason": run_dict.get("end_reason", "-"),
+        "duration_s": run_dict.get("duration_s"),
+        "samples": run_dict.get("samples", 0),
+        "avg_current": run_dict.get("avg_current"),
+        "avg_thrust": run_dict.get("avg_thrust"),
+        "avg_ratio": run_dict.get("avg_ratio"),
+    }
+
+
+def get_run_rows_for_display():
+    with run_lock:
+        rows = [build_run_snapshot(run) for run in run_history]
+
+        if current_run is not None:
+            live_samples = current_run["samples"]
+            live_thrust_samples = current_run["thrust_samples"]
+            live_ratio_samples = current_run["ratio_samples"]
+
+            rows.append(
+                {
+                    "run_id": current_run["run_id"],
+                    "status": "ACTIVE",
+                    "start_time": current_run["start_time"],
+                    "start_cmd": current_run["start_cmd"],
+                    "end_time": "-",
+                    "end_reason": "-",
+                    "duration_s": (datetime.now() - current_run["start_dt"]).total_seconds(),
+                    "samples": live_samples,
+                    "avg_current": (current_run["current_sum"] / live_samples) if live_samples > 0 else None,
+                    "avg_thrust": (current_run["thrust_sum"] / live_thrust_samples) if live_thrust_samples > 0 else None,
+                    "avg_ratio": (current_run["ratio_sum"] / live_ratio_samples) if live_ratio_samples > 0 else None,
+                }
+            )
+
+        return rows
+
+
 # ===================== SERIAL SEND =====================
 def send_command(cmd: str):
-    """
-    Send command to ESP32, also log it to TXT file.
-    """
     global serial_obj
 
     with serial_lock:
@@ -153,6 +351,7 @@ def send_command(cmd: str):
                 serial_obj.write(f"{cmd}\n".encode("utf-8"))
                 add_log(f"> Sent: {cmd}")
                 write_txt_log("TX", cmd)
+                track_command_for_runs(cmd)
             except Exception as e:
                 add_log(f"> Failed to send '{cmd}': {e}")
                 write_txt_log("ERROR", f"Failed TX '{cmd}': {e}")
@@ -163,13 +362,7 @@ def send_command(cmd: str):
 
 # ===================== SERIAL THREAD =====================
 def serial_reader():
-    """
-    Background serial thread:
-    - reads every line
-    - stores all raw serial lines to TXT
-    - parses CSV telemetry to graph + CSV file
-    """
-    global serial_obj, stop_thread
+    global serial_obj, stop_thread, connection_started_dt
 
     add_log("Serial reader thread started.")
     write_txt_log("SYSTEM", "Serial reader thread started")
@@ -192,11 +385,8 @@ def serial_reader():
                 if not line:
                     continue
 
-                # Save every received line to TXT
                 write_txt_log("RX", line)
 
-                # Expected CSV:
-                # ms,raw,v,currentA,lc_raw,lc_grams
                 parts = line.split(",")
 
                 if len(parts) == 6:
@@ -218,6 +408,7 @@ def serial_reader():
                         with data_lock:
                             data_buffer.append(row)
 
+                        update_run_metrics(current_a, thrust_g)
                         write_csv_row(ms, time_s, current_a, thrust_g, line)
 
                     except ValueError:
@@ -228,10 +419,21 @@ def serial_reader():
         except serial.SerialException as e:
             add_log(f"Serial connection lost: {e}")
             write_txt_log("ERROR", f"Serial connection lost: {e}")
+            finalize_current_run("Serial lost")
+            set_motor_status("OFF")
+            set_connection_status("Disconnected.")
+            with state_lock:
+                connection_started_dt = None
             break
+
         except Exception as e:
             add_log(f"Serial Error: {e}")
             write_txt_log("ERROR", f"Serial Error: {e}")
+            finalize_current_run("Serial error")
+            set_motor_status("OFF")
+            set_connection_status("Disconnected.")
+            with state_lock:
+                connection_started_dt = None
             break
 
     add_log("Serial reader thread stopped.")
@@ -241,170 +443,446 @@ def serial_reader():
 # ===================== APP SETUP =====================
 make_session_files()
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG])
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.DARKLY],
+    suppress_callback_exceptions=True,
+)
 app.title = "ESP32 Test Stand"
 
+GLASS_CSS = """
+    body {
+        background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+        background-attachment: fixed;
+        color: #ffffff;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    .glass-panel {
+        background: rgba(255, 255, 255, 0.05);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 15px;
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+        padding: 20px;
+    }
+    .glass-card {
+        background: rgba(255, 255, 255, 0.08);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 12px;
+        box-shadow: 0 4px 16px 0 rgba(0, 0, 0, 0.2);
+    }
+    .glass-input {
+        background: rgba(0, 0, 0, 0.2) !important;
+        border: 1px solid rgba(255, 255, 255, 0.2) !important;
+        color: white !important;
+    }
+    .glass-input:focus {
+        background: rgba(0, 0, 0, 0.4) !important;
+        box-shadow: 0 0 10px rgba(0, 255, 255, 0.2) !important;
+    }
+    .glass-textarea {
+        background: rgba(0, 0, 0, 0.4) !important;
+        border: 1px solid rgba(255, 255, 255, 0.1) !important;
+        color: #00ffcc !important;
+        border-radius: 10px;
+    }
+    .summary-table th,
+    .summary-table td {
+        white-space: nowrap;
+        vertical-align: middle;
+    }
+"""
 
-# ===================== LAYOUT =====================
-sidebar = dbc.Card(
-    [
-        dbc.CardBody(
+app.index_string = f"""
+<!DOCTYPE html>
+<html>
+    <head>
+        {{%metas%}}
+        <title>{{%title%}}</title>
+        {{%favicon%}}
+        {{%css%}}
+        <style>{GLASS_CSS}</style>
+    </head>
+    <body>
+        {{%app_entry%}}
+        <footer>
+            {{%config%}}
+            {{%scripts%}}
+            {{%renderer%}}
+        </footer>
+    </body>
+</html>
+"""
+
+
+def make_navbar():
+    return dbc.Navbar(
+        dbc.Container(
             [
-                html.H4("Connection", className="card-title text-info"),
-
-                dbc.Row(
+                dbc.NavbarBrand("ESP32 Test Stand", className="fw-bold"),
+                dbc.Nav(
                     [
-                        dbc.Col(
-                            dbc.Select(
-                                id="dropdown-port",
-                                options=[],
-                                value=None,
-                                className="mb-2",
-                            ),
-                            width=8,
-                        ),
-                        dbc.Col(
-                            dbc.Button(
-                                "Refresh",
-                                id="btn-refresh-ports",
-                                color="secondary",
-                                className="w-100 mb-2",
-                            ),
-                            width=4,
-                        ),
-                    ]
-                ),
-
-                dbc.Select(
-                    id="dropdown-baud",
-                    options=[{"label": str(b), "value": b} for b in [115200, 9600, 38400, 57600]],
-                    value=115200,
-                    className="mb-3",
-                ),
-
-                dbc.Row(
-                    [
-                        dbc.Col(dbc.Button("Connect", id="btn-connect", color="success", className="w-100")),
-                        dbc.Col(dbc.Button("Disconnect", id="btn-disconnect", color="danger", className="w-100")),
-                    ]
-                ),
-
-                html.Div(id="connection-status", className="mt-2 text-warning"),
-
-                html.Hr(),
-
-                html.H4("Motor Control", className="card-title text-info"),
-                dbc.ButtonGroup(
-                    [
-                        dbc.Button("ON", id="btn-on", color="primary"),
-                        dbc.Button("OFF", id="btn-off", color="secondary"),
-                        dbc.Button("STOP", id="btn-stop", color="danger"),
+                        dbc.NavLink("Dashboard", href="/", active="exact"),
+                        dbc.NavLink("Run Summary", href="/summary", active="exact"),
                     ],
-                    className="w-100 mb-3",
-                ),
-
-                html.Label("Throttle Speed (%)"),
-                dbc.Input(
-                    id="input-speed",
-                    type="number",
-                    min=0,
-                    max=100,
-                    step=1,
-                    value=0,
-                    className="mb-2",
-                ),
-                dbc.Button("Set Speed", id="btn-set-speed", color="info", className="w-100 mt-2 mb-3"),
-
-                html.Hr(),
-
-                html.H4("Load Cell", className="card-title text-info"),
-                dbc.Button("TARE (Zero Scale)", id="btn-tare", color="warning", className="w-100 mb-2"),
-                dbc.Input(id="input-cal", type="number", value=100.0, step=1.0, className="mb-2"),
-                dbc.Button("CALIBRATE", id="btn-cal", color="info", className="w-100 mb-3"),
-
-                html.Hr(),
-
-                dbc.Button("Clear Graphs", id="btn-clear-graphs", color="outline-light", className="w-100 mb-2"),
-                dbc.Button("Clear Logs", id="btn-clear-logs", color="outline-warning", className="w-100"),
-
-                html.Div(id="dummy-output", style={"display": "none"}),
-            ]
-        )
-    ],
-    className="h-100",
-)
-
-main_content = html.Div(
-    [
-        html.H2("📊 Live thrust and current Dashboard", className="mb-4"),
-
-        dbc.Row(
-            [
-                dbc.Col(
-                    dbc.Card(
-                        dbc.CardBody(
-                            [html.H5("Live Current"), html.H3(id="val-current", className="text-danger")]
-                        )
-                    )
-                ),
-                dbc.Col(
-                    dbc.Card(
-                        dbc.CardBody(
-                            [html.H5("Live Thrust"), html.H3(id="val-thrust", className="text-success")]
-                        )
-                    )
-                ),
-                dbc.Col(
-                    dbc.Card(
-                        dbc.CardBody(
-                            [html.H5("Data Points"), html.H3(id="val-points", className="text-info")]
-                        )
-                    )
-                ),
-                dbc.Col(
-                    dbc.Card(
-                        dbc.CardBody(
-                            [html.H5("Motor Status"), html.H3(id="val-motor-status", className="text-warning")]
-                        )
-                    )
+                    pills=True,
+                    className="ms-auto",
                 ),
             ],
-            className="mb-4",
+            fluid=True,
         ),
+        color="dark",
+        dark=True,
+        sticky="top",
+    )
 
-        dbc.Row(
-            [
-                dbc.Col(dcc.Graph(id="graph-current"), width=6),
-                dbc.Col(dcc.Graph(id="graph-thrust"), width=6),
-            ]
-        ),
 
-        html.H4("Console Output", className="mt-4"),
-        dbc.Textarea(
-            id="console-log",
-            style={"width": "100%", "height": "220px", "backgroundColor": "#111", "color": "#0f0"},
-            readOnly=True,
-        ),
+def build_sidebar():
+    return html.Div(
+        [
+            html.H4("🔌 Connection", className="text-info mb-3"),
+            dbc.Row(
+                [
+                    dbc.Col(
+                        dbc.Select(
+                            id="dropdown-port",
+                            options=[],
+                            value=None,
+                            className="glass-input mb-2",
+                        ),
+                        width=8,
+                    ),
+                    dbc.Col(
+                        dbc.Button(
+                            "Refresh",
+                            id="btn-refresh-ports",
+                            color="secondary",
+                            className="w-100 mb-2",
+                        ),
+                        width=4,
+                    ),
+                ]
+            ),
+            dbc.Select(
+                id="dropdown-baud",
+                options=[{"label": f"{b} baud", "value": b} for b in [115200, 9600, 38400, 57600]],
+                value=115200,
+                className="glass-input mb-3",
+            ),
+            dbc.Row(
+                [
+                    dbc.Col(dbc.Button("Connect", id="btn-connect", color="success", className="w-100")),
+                    dbc.Col(dbc.Button("Disconnect", id="btn-disconnect", color="danger", className="w-100")),
+                ]
+            ),
+            html.Div(id="connection-status", className="mt-2 text-warning fw-bold"),
 
-        html.Div(id="log-path-display", className="mt-3 text-info"),
-        html.Div(id="csv-path-display", className="mt-1 text-info"),
+            html.Hr(style={"borderColor": "rgba(255,255,255,0.2)"}),
 
+            html.H4("⚙️ Motor Control", className="text-info mb-3"),
+            dbc.ButtonGroup(
+                [
+                    dbc.Button("ON", id="btn-on", color="primary"),
+                    dbc.Button("OFF", id="btn-off", color="secondary"),
+                    dbc.Button("STOP", id="btn-stop", color="danger"),
+                ],
+                className="w-100 mb-3",
+            ),
+            html.Label("Throttle Speed (%)"),
+            dbc.Input(
+                id="input-speed",
+                type="number",
+                min=0,
+                max=100,
+                step=1,
+                value=0,
+                className="glass-input mb-2",
+            ),
+            dbc.Button("Set Speed", id="btn-set-speed", color="info", className="w-100 mt-2 mb-3"),
+
+            html.Hr(style={"borderColor": "rgba(255,255,255,0.2)"}),
+
+            html.H4("⚖️ Load Cell", className="text-info mb-3"),
+            dbc.Button("TARE (Zero Scale)", id="btn-tare", color="warning", className="w-100 mb-2"),
+            dbc.Input(id="input-cal", type="number", value=100.0, step=1.0, className="glass-input mb-2"),
+            dbc.Button("CALIBRATE", id="btn-cal", color="info", className="w-100 mb-4"),
+
+            html.Hr(style={"borderColor": "rgba(255,255,255,0.2)"}),
+
+            html.H4("🧹 Data Management", className="text-info mb-3"),
+            dbc.Button(
+                "Clear Graphs & Data",
+                id="btn-clear-graphs",
+                color="outline-danger",
+                className="w-100 mb-2 fw-bold",
+            ),
+            dbc.Button("Clear Logs", id="btn-clear-logs", color="outline-warning", className="w-100"),
+
+            html.Div(id="dummy-output", style={"display": "none"}),
+        ],
+        className="glass-panel h-100",
+    )
+
+
+def build_dashboard_page():
+    return dbc.Container(
+        [
+            dbc.Row(
+                [
+                    dbc.Col(build_sidebar(), width=3),
+                    dbc.Col(
+                        html.Div(
+                            [
+                                html.H2("📊 Live Telemetry Dashboard", className="mb-4 fw-bold"),
+
+                                dbc.Row(
+                                    [
+                                        dbc.Col(
+                                            dbc.Card(
+                                                dbc.CardBody(
+                                                    [
+                                                        html.H6("Live Current", className="text-muted"),
+                                                        html.H3(id="val-current", className="text-danger"),
+                                                    ]
+                                                ),
+                                                className="glass-card text-center",
+                                            )
+                                        ),
+                                        dbc.Col(
+                                            dbc.Card(
+                                                dbc.CardBody(
+                                                    [
+                                                        html.H6("Live Thrust", className="text-muted"),
+                                                        html.H3(id="val-thrust", className="text-success"),
+                                                    ]
+                                                ),
+                                                className="glass-card text-center",
+                                            )
+                                        ),
+                                        dbc.Col(
+                                            dbc.Card(
+                                                dbc.CardBody(
+                                                    [
+                                                        html.H6("Data Points", className="text-muted"),
+                                                        html.H3(id="val-points", className="text-info"),
+                                                    ]
+                                                ),
+                                                className="glass-card text-center",
+                                            )
+                                        ),
+                                        dbc.Col(
+                                            dbc.Card(
+                                                dbc.CardBody(
+                                                    [
+                                                        html.H6("Motor Status", className="text-muted"),
+                                                        html.H3(id="val-motor-status", className="text-warning"),
+                                                    ]
+                                                ),
+                                                className="glass-card text-center",
+                                            )
+                                        ),
+                                    ],
+                                    className="mb-3",
+                                ),
+
+                                dbc.Row(
+                                    [
+                                        dbc.Col(
+                                            dbc.Card(
+                                                dbc.CardBody(
+                                                    [
+                                                        html.H6("Connection Timer", className="text-muted"),
+                                                        html.H3(id="val-connection-timer", className="text-primary"),
+                                                    ]
+                                                ),
+                                                className="glass-card text-center",
+                                            )
+                                        ),
+                                        dbc.Col(
+                                            dbc.Card(
+                                                dbc.CardBody(
+                                                    [
+                                                        html.H6("Active Timer", className="text-muted"),
+                                                        html.H3(id="val-active-timer", className="text-info"),
+                                                    ]
+                                                ),
+                                                className="glass-card text-center",
+                                            )
+                                        ),
+                                    ],
+                                    className="mb-4",
+                                ),
+
+                                dbc.Row(
+                                    [
+                                        dbc.Col(html.Div(dcc.Graph(id="graph-current"), className="glass-panel mb-3"), width=6),
+                                        dbc.Col(html.Div(dcc.Graph(id="graph-thrust"), className="glass-panel mb-3"), width=6),
+                                    ]
+                                ),
+
+                                html.Div(
+                                    [
+                                        html.H5("💻 Console Output", className="mb-3"),
+                                        dbc.Textarea(
+                                            id="console-log",
+                                            className="glass-textarea",
+                                            style={"width": "100%", "height": "200px"},
+                                            readOnly=True,
+                                        ),
+                                        html.Div(id="log-path-display", className="mt-3 text-muted small"),
+                                        html.Div(id="csv-path-display", className="mt-1 text-muted small"),
+                                    ],
+                                    className="glass-panel mt-2",
+                                ),
+                            ]
+                        ),
+                        width=9,
+                    ),
+                ],
+                className="mt-4 pb-4",
+            )
+        ],
+        fluid=True,
+    )
+
+
+def build_summary_page():
+    return dbc.Container(
+        [
+            dbc.Row(
+                [
+                    dbc.Col(
+                        html.Div(
+                            [
+                                html.H2("🧾 Run Summary", className="fw-bold mb-4"),
+                                dbc.Row(
+                                    [
+                                        dbc.Col(
+                                            dbc.Card(
+                                                dbc.CardBody(
+                                                    [
+                                                        html.H6("Completed Runs", className="text-muted"),
+                                                        html.H3(id="summary-total-runs", className="text-info"),
+                                                    ]
+                                                ),
+                                                className="glass-card text-center mb-3",
+                                            ),
+                                            md=3,
+                                        ),
+                                        dbc.Col(
+                                            dbc.Card(
+                                                dbc.CardBody(
+                                                    [
+                                                        html.H6("Active Run", className="text-muted"),
+                                                        html.H3(id="summary-active-status", className="text-warning"),
+                                                    ]
+                                                ),
+                                                className="glass-card text-center mb-3",
+                                            ),
+                                            md=3,
+                                        ),
+                                        dbc.Col(
+                                            dbc.Card(
+                                                dbc.CardBody(
+                                                    [
+                                                        html.H6("Latest Run Start", className="text-muted"),
+                                                        html.H5(id="summary-last-run", className="text-success"),
+                                                    ]
+                                                ),
+                                                className="glass-card text-center mb-3",
+                                            ),
+                                            md=3,
+                                        ),
+                                        dbc.Col(
+                                            dbc.Card(
+                                                dbc.CardBody(
+                                                    [
+                                                        html.H6("Latest Avg T/I", className="text-muted"),
+                                                        html.H3(id="summary-latest-eff", className="text-primary"),
+                                                    ]
+                                                ),
+                                                className="glass-card text-center mb-3",
+                                            ),
+                                            md=3,
+                                        ),
+                                    ]
+                                ),
+
+                                html.Div(
+                                    [
+                                        html.H5("Active Run Detail", className="mb-3"),
+                                        html.Div(id="summary-active-detail"),
+                                    ],
+                                    className="glass-panel mb-4",
+                                ),
+
+                                html.Div(
+                                    [
+                                        html.H5("Run Table", className="mb-3"),
+                                        html.Div(
+                                            [
+                                                dbc.Table(
+                                                    [
+                                                        html.Thead(
+                                                            html.Tr(
+                                                                [
+                                                                    html.Th("#"),
+                                                                    html.Th("Status"),
+                                                                    html.Th("Run Command Time"),
+                                                                    html.Th("Trigger Cmd"),
+                                                                    html.Th("End Time"),
+                                                                    html.Th("End Reason"),
+                                                                    html.Th("Duration (s)"),
+                                                                    html.Th("Samples"),
+                                                                    html.Th("Avg Current (A)"),
+                                                                    html.Th("Avg Thrust (g)"),
+                                                                    html.Th("Avg T/I (g/A)"),
+                                                                ]
+                                                            )
+                                                        ),
+                                                        html.Tbody(id="summary-table-body"),
+                                                    ],
+                                                    bordered=False,
+                                                    hover=True,
+                                                    responsive=True,
+                                                    class_name="summary-table",
+                                                )
+                                            ],
+                                            style={"overflowX": "auto"},
+                                        ),
+                                    ],
+                                    className="glass-panel",
+                                ),
+                            ],
+                            className="mt-4 pb-4",
+                        ),
+                        width=12,
+                    )
+                ]
+            )
+        ],
+        fluid=True,
+    )
+
+
+app.layout = html.Div(
+    [
+        dcc.Location(id="url"),
+        make_navbar(),
         dcc.Interval(id="update-interval", interval=500, n_intervals=0),
+        html.Div(id="page-content"),
     ]
 )
 
-app.layout = dbc.Container(
-    [
-        dbc.Row(
-            [
-                dbc.Col(sidebar, width=3),
-                dbc.Col(main_content, width=9),
-            ],
-            className="mt-4",
-        )
-    ],
-    fluid=True,
-)
+
+# ===================== PAGE ROUTING =====================
+@app.callback(Output("page-content", "children"), Input("url", "pathname"))
+def render_page(pathname):
+    if pathname == "/summary":
+        return build_summary_page()
+    return build_dashboard_page()
 
 
 # ===================== CALLBACKS =====================
@@ -436,7 +914,7 @@ def refresh_ports(_, __, current_value):
     prevent_initial_call=True,
 )
 def manage_connection(btn_conn, btn_disconn, port, baud):
-    global serial_obj, serial_thread, stop_thread
+    global serial_obj, serial_thread, stop_thread, connection_started_dt
 
     trigger = ctx.triggered_id
 
@@ -457,6 +935,9 @@ def manage_connection(btn_conn, btn_disconn, port, baud):
                 serial_thread = threading.Thread(target=serial_reader, daemon=True)
                 serial_thread.start()
 
+                with state_lock:
+                    connection_started_dt = datetime.now()
+
                 msg = f"Connected to {port}"
                 set_connection_status(msg)
                 add_log(f"Connected to {port} @ {baud} baud")
@@ -467,6 +948,8 @@ def manage_connection(btn_conn, btn_disconn, port, baud):
                 add_log(f"Connection failed: {e}")
                 write_txt_log("ERROR", f"Connection failed: {e}")
                 serial_obj = None
+                with state_lock:
+                    connection_started_dt = None
                 msg = f"Error: {e}"
                 set_connection_status(msg)
                 return msg
@@ -479,15 +962,21 @@ def manage_connection(btn_conn, btn_disconn, port, baud):
                     serial_obj.close()
                     add_log("Disconnected from serial port.")
                     write_txt_log("DISCONNECTED", "Serial port closed")
+                    finalize_current_run("Disconnect")
+                    set_motor_status("OFF")
                 except Exception as e:
                     add_log(f"Disconnect error: {e}")
                     write_txt_log("ERROR", f"Disconnect error: {e}")
                 finally:
                     serial_obj = None
+                    with state_lock:
+                        connection_started_dt = None
 
                 set_connection_status("Disconnected.")
                 return "Disconnected."
 
+            with state_lock:
+                connection_started_dt = None
             set_connection_status("Already disconnected.")
             return "Already disconnected."
 
@@ -531,6 +1020,10 @@ def handle_commands(btn_on, btn_off, btn_stop, btn_spd, btn_tare, btn_cal, btn_c
                 write_txt_log("ERROR", f"Invalid SPEED value: {speed}")
             else:
                 send_command(f"SPEED {speed}")
+                if speed > 0:
+                    set_motor_status(f"RUN {speed}%")
+                else:
+                    set_motor_status("ON")
         except (TypeError, ValueError):
             add_log("> Error: Invalid speed value.")
             write_txt_log("ERROR", f"Invalid speed input: {speed}")
@@ -567,6 +1060,8 @@ def handle_commands(btn_on, btn_off, btn_stop, btn_spd, btn_tare, btn_cal, btn_c
     Output("val-thrust", "children"),
     Output("val-points", "children"),
     Output("val-motor-status", "children"),
+    Output("val-connection-timer", "children"),
+    Output("val-active-timer", "children"),
     Output("console-log", "value"),
     Output("log-path-display", "children"),
     Output("csv-path-display", "children"),
@@ -580,6 +1075,8 @@ def update_dashboard(n):
         rows = list(data_buffer)
 
     motor = get_motor_status()
+    connection_timer = get_connection_elapsed_str()
+    active_timer = get_active_run_elapsed_str()
 
     if rows:
         df = pd.DataFrame(rows)
@@ -598,17 +1095,20 @@ def update_dashboard(n):
                 y=df["Current (A)"],
                 mode="lines",
                 name="Current",
+                line=dict(color="#ff4d4d", width=2),
             )
         )
         fig_curr.update_layout(
-            title="Current (A)",
+            title=dict(text="Current (A)", font=dict(color="white")),
             margin=dict(l=20, r=20, t=40, b=30),
             height=320,
-            template="plotly_dark",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             xaxis_title="Time (s)",
             yaxis_title="Current (A)",
+            font=dict(color="#e0e0e0"),
+            xaxis=dict(gridcolor="rgba(255,255,255,0.1)", zerolinecolor="rgba(255,255,255,0.1)"),
+            yaxis=dict(gridcolor="rgba(255,255,255,0.1)", zerolinecolor="rgba(255,255,255,0.1)"),
         )
 
         fig_thrust = go.Figure()
@@ -619,17 +1119,21 @@ def update_dashboard(n):
                 mode="lines+markers",
                 name="Thrust",
                 connectgaps=False,
+                line=dict(color="#00ffcc", width=2),
+                marker=dict(size=4),
             )
         )
         fig_thrust.update_layout(
-            title="Thrust (g)",
+            title=dict(text="Thrust (g)", font=dict(color="white")),
             margin=dict(l=20, r=20, t=40, b=30),
             height=320,
-            template="plotly_dark",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             xaxis_title="Time (s)",
             yaxis_title="Thrust (g)",
+            font=dict(color="#e0e0e0"),
+            xaxis=dict(gridcolor="rgba(255,255,255,0.1)", zerolinecolor="rgba(255,255,255,0.1)"),
+            yaxis=dict(gridcolor="rgba(255,255,255,0.1)", zerolinecolor="rgba(255,255,255,0.1)"),
         )
 
     else:
@@ -642,9 +1146,100 @@ def update_dashboard(n):
     log_path_text = f"TXT log file: {TXT_LOG_PATH}"
     csv_path_text = f"CSV data file: {CSV_LOG_PATH}"
 
-    return fig_curr, fig_thrust, curr_val, thrust_val, pts, motor, logs, log_path_text, csv_path_text
+    return (
+        fig_curr,
+        fig_thrust,
+        curr_val,
+        thrust_val,
+        pts,
+        motor,
+        connection_timer,
+        active_timer,
+        logs,
+        log_path_text,
+        csv_path_text,
+    )
 
 
-# ===================== RUN =====================
+@app.callback(
+    Output("summary-total-runs", "children"),
+    Output("summary-active-status", "children"),
+    Output("summary-last-run", "children"),
+    Output("summary-latest-eff", "children"),
+    Output("summary-active-detail", "children"),
+    Output("summary-table-body", "children"),
+    Input("update-interval", "n_intervals"),
+)
+def update_summary_page(n):
+    rows = get_run_rows_for_display()
+
+    completed_rows = [row for row in rows if row["status"] == "Completed"]
+    active_rows = [row for row in rows if row["status"] == "ACTIVE"]
+
+    total_runs = str(len(completed_rows))
+    active_status = "YES" if active_rows else "NO"
+
+    latest_run = rows[-1]["start_time"] if rows else "-"
+    latest_eff = "-"
+    if rows and rows[-1]["avg_ratio"] is not None:
+        latest_eff = f"{rows[-1]['avg_ratio']:.2f} g/A"
+
+    if active_rows:
+        active = active_rows[-1]
+        active_detail = html.Ul(
+            [
+                html.Li(f"Run command time: {active['start_time']}"),
+                html.Li(f"Trigger command: {active['start_cmd']}"),
+                html.Li(f"Duration: {active['duration_s']:.2f} s"),
+                html.Li(f"Samples: {active['samples']}"),
+                html.Li(
+                    "Average current: "
+                    + (f"{active['avg_current']:.3f} A" if active["avg_current"] is not None else "N/A")
+                ),
+                html.Li(
+                    "Average thrust: "
+                    + (f"{active['avg_thrust']:.3f} g" if active["avg_thrust"] is not None else "N/A")
+                ),
+                html.Li(
+                    "Average thrust/current: "
+                    + (f"{active['avg_ratio']:.3f} g/A" if active["avg_ratio"] is not None else "N/A")
+                ),
+            ]
+        )
+    else:
+        active_detail = html.Div("No active run right now.", className="text-muted")
+
+    if rows:
+        body_rows = []
+        for row in rows:
+            body_rows.append(
+                html.Tr(
+                    [
+                        html.Td(row["run_id"]),
+                        html.Td(row["status"]),
+                        html.Td(row["start_time"]),
+                        html.Td(row["start_cmd"]),
+                        html.Td(row["end_time"]),
+                        html.Td(row["end_reason"]),
+                        html.Td(f"{row['duration_s']:.2f}" if row["duration_s"] is not None else "-"),
+                        html.Td(row["samples"]),
+                        html.Td(f"{row['avg_current']:.3f}" if row["avg_current"] is not None else "-"),
+                        html.Td(f"{row['avg_thrust']:.3f}" if row["avg_thrust"] is not None else "-"),
+                        html.Td(f"{row['avg_ratio']:.3f}" if row["avg_ratio"] is not None else "-"),
+                    ]
+                )
+            )
+    else:
+        body_rows = [
+            html.Tr(
+                [
+                    html.Td("No run data yet.", colSpan=11, className="text-center text-muted")
+                ]
+            )
+        ]
+
+    return total_runs, active_status, latest_run, latest_eff, active_detail, body_rows
+
+
 if __name__ == "__main__":
-    app.run(debug=False, port=8050)
+    app.run(debug=True)
