@@ -43,8 +43,8 @@ static bool zeroDone = false;
 static uint32_t t0 = 0;
 
 // ===================== HX711 SETTINGS =====================
-const byte HX_DOUT_PIN = 25;
-const byte HX_SCK_PIN  = 26;
+const byte HX_DOUT_PIN = 35;
+const byte HX_SCK_PIN  = 32;
 
 float calibrationFactor = 1.0f;   // counts per gram
 bool isTared = false;
