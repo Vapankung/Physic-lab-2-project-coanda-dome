@@ -65,7 +65,7 @@ def make_session_files():
 
         with open(CSV_LOG_PATH, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["pc_time", "ms", "time_s", "raw_adc", "voltage_v", "current_a", "thrust_g", "power_w", "thrust_per_power_gw", "raw_line"])
+            writer.writerow(["pc_time", "ms", "time_s", "current_a", "thrust_g", "raw_line"])
 
 
 def add_log(message: str):
@@ -85,7 +85,7 @@ def write_txt_log(tag: str, message: str):
             f.write(line)
 
 
-def write_csv_row(ms, time_s, raw_adc, voltage_v, current_a, thrust_g, raw_line):
+def write_csv_row(ms, time_s, current_a, thrust_g, raw_line):
     if not CSV_LOG_PATH:
         return
 
@@ -94,9 +94,7 @@ def write_csv_row(ms, time_s, raw_adc, voltage_v, current_a, thrust_g, raw_line)
     with file_lock:
         with open(CSV_LOG_PATH, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            power_w = (voltage_v * current_a) if (voltage_v is not None and current_a is not None) else None
-            thrust_per_power = (thrust_g / power_w) if (thrust_g is not None and power_w not in (None, 0)) else None
-            writer.writerow([pc_time, ms, time_s, raw_adc, voltage_v, current_a, thrust_g, power_w, thrust_per_power, raw_line])
+            writer.writerow([pc_time, ms, time_s, current_a, thrust_g, raw_line])
 
 
 def get_available_ports():
@@ -185,10 +183,8 @@ def finalize_current_run(reason: str):
         ratio_samples = current_run["ratio_samples"]
 
         avg_current = (current_run["current_sum"] / samples) if samples > 0 else None
-        avg_voltage = (current_run["voltage_sum"] / current_run["voltage_samples"]) if current_run["voltage_samples"] > 0 else None
         avg_thrust = (current_run["thrust_sum"] / thrust_samples) if thrust_samples > 0 else None
         avg_ratio = (current_run["ratio_sum"] / ratio_samples) if ratio_samples > 0 else None
-        avg_thrust_power = (current_run["thrust_power_sum"] / current_run["thrust_power_samples"]) if current_run["thrust_power_samples"] > 0 else None
 
         run_history.append(
             {
@@ -201,10 +197,8 @@ def finalize_current_run(reason: str):
                 "duration_s": (end_dt - current_run["start_dt"]).total_seconds(),
                 "samples": samples,
                 "avg_current": avg_current,
-                "avg_voltage": avg_voltage,
                 "avg_thrust": avg_thrust,
                 "avg_ratio": avg_ratio,
-                "avg_thrust_power": avg_thrust_power,
             }
         )
 
@@ -227,28 +221,20 @@ def start_new_run(trigger_cmd: str):
             "start_cmd": trigger_cmd,
             "samples": 0,
             "current_sum": 0.0,
-            "voltage_sum": 0.0,
             "thrust_sum": 0.0,
             "ratio_sum": 0.0,
-            "thrust_power_sum": 0.0,
-            "voltage_samples": 0,
             "thrust_samples": 0,
             "ratio_samples": 0,
-            "thrust_power_samples": 0,
         }
 
 
-def update_run_metrics(current_a, thrust_g, voltage_v=None):
+def update_run_metrics(current_a, thrust_g):
     with run_lock:
         if current_run is None:
             return
 
         current_run["samples"] += 1
         current_run["current_sum"] += current_a
-
-        if voltage_v is not None:
-            current_run["voltage_sum"] += voltage_v
-            current_run["voltage_samples"] += 1
 
         if thrust_g is not None:
             current_run["thrust_sum"] += thrust_g
@@ -257,12 +243,6 @@ def update_run_metrics(current_a, thrust_g, voltage_v=None):
             if current_a > 0:
                 current_run["ratio_sum"] += (thrust_g / current_a)
                 current_run["ratio_samples"] += 1
-
-            if voltage_v is not None:
-                power_w = voltage_v * current_a
-                if power_w > 0:
-                    current_run["thrust_power_sum"] += (thrust_g / power_w)
-                    current_run["thrust_power_samples"] += 1
 
 
 def parse_speed_percent(cmd: str):
@@ -337,10 +317,8 @@ def build_run_snapshot(run_dict: dict, status: str = "Completed"):
         "duration_s": run_dict.get("duration_s"),
         "samples": run_dict.get("samples", 0),
         "avg_current": run_dict.get("avg_current"),
-        "avg_voltage": run_dict.get("avg_voltage"),
         "avg_thrust": run_dict.get("avg_thrust"),
         "avg_ratio": run_dict.get("avg_ratio"),
-        "avg_thrust_power": run_dict.get("avg_thrust_power"),
     }
 
 
@@ -350,10 +328,8 @@ def get_run_rows_for_display():
 
         if current_run is not None:
             live_samples = current_run["samples"]
-            live_voltage_samples = current_run["voltage_samples"]
             live_thrust_samples = current_run["thrust_samples"]
             live_ratio_samples = current_run["ratio_samples"]
-            live_thrust_power_samples = current_run["thrust_power_samples"]
 
             rows.append(
                 {
@@ -366,10 +342,8 @@ def get_run_rows_for_display():
                     "duration_s": (datetime.now() - current_run["start_dt"]).total_seconds(),
                     "samples": live_samples,
                     "avg_current": (current_run["current_sum"] / live_samples) if live_samples > 0 else None,
-                    "avg_voltage": (current_run["voltage_sum"] / live_voltage_samples) if live_voltage_samples > 0 else None,
                     "avg_thrust": (current_run["thrust_sum"] / live_thrust_samples) if live_thrust_samples > 0 else None,
                     "avg_ratio": (current_run["ratio_sum"] / live_ratio_samples) if live_ratio_samples > 0 else None,
-                    "avg_thrust_power": (current_run["thrust_power_sum"] / live_thrust_power_samples) if live_thrust_power_samples > 0 else None,
                 }
             )
 
@@ -427,32 +401,24 @@ def serial_reader():
                 if len(parts) == 6:
                     try:
                         ms = int(parts[0].strip())
-                        raw_adc = int(parts[1].strip())
-                        voltage_v = float(parts[2].strip())
                         current_a = float(parts[3].strip())
 
                         lc_str = parts[5].strip().upper()
                         thrust_g = None if lc_str in ("NA", "", "NONE", "NAN") else float(parts[5].strip())
-                        power_w = voltage_v * current_a
-                        thrust_per_power = (thrust_g / power_w) if (thrust_g is not None and power_w > 0) else None
 
                         time_s = ms / 1000.0
 
                         row = {
                             "Time (s)": time_s,
-                            "Raw ADC": raw_adc,
-                            "Voltage (V)": voltage_v,
                             "Current (A)": current_a,
-                            "Power (W)": power_w,
                             "Thrust (g)": thrust_g,
-                            "Thrust/Power (g/W)": thrust_per_power,
                         }
 
                         with data_lock:
                             data_buffer.append(row)
 
-                        update_run_metrics(current_a, thrust_g, voltage_v)
-                        write_csv_row(ms, time_s, raw_adc, voltage_v, current_a, thrust_g, line)
+                        update_run_metrics(current_a, thrust_g)
+                        write_csv_row(ms, time_s, current_a, thrust_g, line)
 
                     except ValueError:
                         add_log(line)
@@ -490,74 +456,32 @@ def serial_reader():
 # ===================== APP SETUP =====================
 make_session_files()
 
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+os.makedirs(ASSETS_DIR, exist_ok=True)
+
 app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.DARKLY],
     suppress_callback_exceptions=True,
+    assets_folder=ASSETS_DIR,
 )
 app.title = "ESP32 Test Stand"
 
-GLASS_CSS = """
-    body {
-        background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
-        background-attachment: fixed;
-        color: #ffffff;
-        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    }
-    .glass-panel {
-        background: rgba(255, 255, 255, 0.05);
-        backdrop-filter: blur(16px);
-        -webkit-backdrop-filter: blur(16px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 15px;
-        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-        padding: 20px;
-    }
-    .glass-card {
-        background: rgba(255, 255, 255, 0.08);
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 12px;
-        box-shadow: 0 4px 16px 0 rgba(0, 0, 0, 0.2);
-    }
-    .glass-input {
-        background: rgba(0, 0, 0, 0.2) !important;
-        border: 1px solid rgba(255, 255, 255, 0.2) !important;
-        color: white !important;
-    }
-    .glass-input:focus {
-        background: rgba(0, 0, 0, 0.4) !important;
-        box-shadow: 0 0 10px rgba(0, 255, 255, 0.2) !important;
-    }
-    .glass-textarea {
-        background: rgba(0, 0, 0, 0.4) !important;
-        border: 1px solid rgba(255, 255, 255, 0.1) !important;
-        color: #00ffcc !important;
-        border-radius: 10px;
-    }
-    .summary-table th,
-    .summary-table td {
-        white-space: nowrap;
-        vertical-align: middle;
-    }
-"""
-
-app.index_string = f"""
+app.index_string = """
 <!DOCTYPE html>
 <html>
     <head>
-        {{%metas%}}
-        <title>{{%title%}}</title>
-        {{%favicon%}}
-        {{%css%}}
-        <style>{GLASS_CSS}</style>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
     </head>
     <body>
-        {{%app_entry%}}
+        {%app_entry%}
         <footer>
-            {{%config%}}
-            {{%scripts%}}
-            {{%renderer%}}
+            {%config%}
+            {%scripts%}
+            {%renderer%}
         </footer>
     </body>
 </html>
@@ -589,7 +513,7 @@ def make_navbar():
 def build_sidebar():
     return html.Div(
         [
-            html.H4("Connection", className="text-info mb-3"),
+            html.H4("🔌 Connection", className="text-info mb-3"),
             dbc.Row(
                 [
                     dbc.Col(
@@ -628,7 +552,7 @@ def build_sidebar():
 
             html.Hr(style={"borderColor": "rgba(255,255,255,0.2)"}),
 
-            html.H4("Motor Control", className="text-info mb-3"),
+            html.H4("⚙️ Motor Control", className="text-info mb-3"),
             dbc.ButtonGroup(
                 [
                     dbc.Button("ON", id="btn-on", color="primary"),
@@ -651,14 +575,14 @@ def build_sidebar():
 
             html.Hr(style={"borderColor": "rgba(255,255,255,0.2)"}),
 
-            html.H4("Load Cell", className="text-info mb-3"),
+            html.H4("⚖️ Load Cell", className="text-info mb-3"),
             dbc.Button("TARE (Zero Scale)", id="btn-tare", color="warning", className="w-100 mb-2"),
             dbc.Input(id="input-cal", type="number", value=100.0, step=1.0, className="glass-input mb-2"),
             dbc.Button("CALIBRATE", id="btn-cal", color="info", className="w-100 mb-4"),
 
             html.Hr(style={"borderColor": "rgba(255,255,255,0.2)"}),
 
-            html.H4("Data Management", className="text-info mb-3"),
+            html.H4("🧹 Data Management", className="text-info mb-3"),
             dbc.Button(
                 "Clear Graphs & Data",
                 id="btn-clear-graphs",
@@ -682,7 +606,7 @@ def build_dashboard_page():
                     dbc.Col(
                         html.Div(
                             [
-                                html.H2("Live Data Dashboard", className="mb-4 fw-bold"),
+                                html.H2("📊 Live Telemetry Dashboard", className="mb-4 fw-bold"),
 
                                 dbc.Row(
                                     [
@@ -846,7 +770,7 @@ def build_summary_page():
                                             dbc.Card(
                                                 dbc.CardBody(
                                                     [
-                                                        html.H6("Latest Avg T/P", className="text-muted"),
+                                                        html.H6("Latest Avg T/I", className="text-muted"),
                                                         html.H3(id="summary-latest-eff", className="text-primary"),
                                                     ]
                                                 ),
@@ -884,9 +808,8 @@ def build_summary_page():
                                                                     html.Th("Duration (s)"),
                                                                     html.Th("Samples"),
                                                                     html.Th("Avg Current (A)"),
-                                                                    html.Th("Avg Voltage (V)"),
                                                                     html.Th("Avg Thrust (g)"),
-                                                                    html.Th("Avg T/P (g/W)"),
+                                                                    html.Th("Avg T/I (g/A)"),
                                                                 ]
                                                             )
                                                         ),
@@ -1229,8 +1152,8 @@ def update_summary_page(n):
 
     latest_run = rows[-1]["start_time"] if rows else "-"
     latest_eff = "-"
-    if rows and rows[-1]["avg_thrust_power"] is not None:
-        latest_eff = f"{rows[-1]['avg_thrust_power']:.2f} g/W"
+    if rows and rows[-1]["avg_ratio"] is not None:
+        latest_eff = f"{rows[-1]['avg_ratio']:.2f} g/A"
 
     if active_rows:
         active = active_rows[-1]
@@ -1245,20 +1168,12 @@ def update_summary_page(n):
                     + (f"{active['avg_current']:.3f} A" if active["avg_current"] is not None else "N/A")
                 ),
                 html.Li(
-                    "Average voltage: "
-                    + (f"{active['avg_voltage']:.3f} V" if active["avg_voltage"] is not None else "N/A")
-                ),
-                html.Li(
                     "Average thrust: "
                     + (f"{active['avg_thrust']:.3f} g" if active["avg_thrust"] is not None else "N/A")
                 ),
                 html.Li(
                     "Average thrust/current: "
                     + (f"{active['avg_ratio']:.3f} g/A" if active["avg_ratio"] is not None else "N/A")
-                ),
-                html.Li(
-                    "Average thrust/power: "
-                    + (f"{active['avg_thrust_power']:.3f} g/W" if active["avg_thrust_power"] is not None else "N/A")
                 ),
             ]
         )
@@ -1280,10 +1195,8 @@ def update_summary_page(n):
                         html.Td(f"{row['duration_s']:.2f}" if row["duration_s"] is not None else "-"),
                         html.Td(row["samples"]),
                         html.Td(f"{row['avg_current']:.3f}" if row["avg_current"] is not None else "-"),
-                        html.Td(f"{row['avg_voltage']:.3f}" if row["avg_voltage"] is not None else "-"),
                         html.Td(f"{row['avg_thrust']:.3f}" if row["avg_thrust"] is not None else "-"),
                         html.Td(f"{row['avg_ratio']:.3f}" if row["avg_ratio"] is not None else "-"),
-                        html.Td(f"{row['avg_thrust_power']:.3f}" if row["avg_thrust_power"] is not None else "-"),
                     ]
                 )
             )
@@ -1291,7 +1204,7 @@ def update_summary_page(n):
         body_rows = [
             html.Tr(
                 [
-                    html.Td("No run data yet.", colSpan=13, className="text-center text-muted")
+                    html.Td("No run data yet.", colSpan=11, className="text-center text-muted")
                 ]
             )
         ]
