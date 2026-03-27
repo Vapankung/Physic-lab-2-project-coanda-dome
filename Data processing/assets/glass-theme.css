@@ -1,5 +1,5 @@
     body {
-        background: linear-gradient(135deg, #1d0f27, #412043, #642c62);
+        background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
         background-attachment: fixed;
         color: #ffffff;
         font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -27,12 +27,12 @@
     }
     .glass-input:focus {
         background: rgba(0, 0, 0, 0.4) !important;
-        box-shadow: 0 0 10px rgba(162, 0, 255, 0.2) !important;
+        box-shadow: 0 0 10px rgba(0, 255, 255, 0.2) !important;
     }
     .glass-textarea {
         background: rgba(0, 0, 0, 0.4) !important;
         border: 1px solid rgba(255, 255, 255, 0.1) !important;
-        color: #b300ff !important;
+        color: #00ffcc !important;
         border-radius: 10px;
     }
     .summary-table th,

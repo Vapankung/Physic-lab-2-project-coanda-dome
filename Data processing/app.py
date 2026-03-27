@@ -513,7 +513,7 @@ def make_navbar():
 def build_sidebar():
     return html.Div(
         [
-            html.H4("🔌 Connection", className="text-info mb-3"),
+            html.H4("Connection", className="text-info mb-3"),
             dbc.Row(
                 [
                     dbc.Col(
@@ -552,7 +552,7 @@ def build_sidebar():
 
             html.Hr(style={"borderColor": "rgba(255,255,255,0.2)"}),
 
-            html.H4("⚙️ Motor Control", className="text-info mb-3"),
+            html.H4("Motor Control", className="text-info mb-3"),
             dbc.ButtonGroup(
                 [
                     dbc.Button("ON", id="btn-on", color="primary"),
@@ -575,14 +575,14 @@ def build_sidebar():
 
             html.Hr(style={"borderColor": "rgba(255,255,255,0.2)"}),
 
-            html.H4("⚖️ Load Cell", className="text-info mb-3"),
+            html.H4("Load Cell", className="text-info mb-3"),
             dbc.Button("TARE (Zero Scale)", id="btn-tare", color="warning", className="w-100 mb-2"),
             dbc.Input(id="input-cal", type="number", value=100.0, step=1.0, className="glass-input mb-2"),
             dbc.Button("CALIBRATE", id="btn-cal", color="info", className="w-100 mb-4"),
 
             html.Hr(style={"borderColor": "rgba(255,255,255,0.2)"}),
 
-            html.H4("🧹 Data Management", className="text-info mb-3"),
+            html.H4("Data Management", className="text-info mb-3"),
             dbc.Button(
                 "Clear Graphs & Data",
                 id="btn-clear-graphs",
@@ -606,7 +606,7 @@ def build_dashboard_page():
                     dbc.Col(
                         html.Div(
                             [
-                                html.H2("📊 Live Telemetry Dashboard", className="mb-4 fw-bold"),
+                                html.H2("Live Data Dashboard", className="mb-4 fw-bold"),
 
                                 dbc.Row(
                                     [
