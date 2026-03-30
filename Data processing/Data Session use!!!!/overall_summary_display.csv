@@ -1,0 +1,5 @@
+condition,rows_analyzed,current_A_display,current_A_sd,thrust_g_display,thrust_g_sd,power_W_display,power_W_sd,overall_peak_thrust_g,efficiency_g_per_A_display,efficiency_g_per_W_display
+Without dome,1508,3.313 ± 0.053 A,SD: 2.076,149.41 ± 5.63 g,SD: 114.88,36.770 ± 0.594 W,SD: 23.048,363.43,45.11 g/A,4.06 g/W
+With dome gina,1514,3.160 ± 0.052 A,SD: 2.038,110.48 ± 3.99 g,SD: 81.40,35.079 ± 0.581 W,SD: 22.625,271.15,34.96 g/A,3.15 g/W
+With dome Saipan,1513,3.205 ± 0.053 A,SD: 2.051,74.26 ± 2.96 g,SD: 60.66,35.571 ± 0.585 W,SD: 22.766,188.89,23.17 g/A,2.09 g/W
+With dome Saipan 1,1510,3.101 ± 0.048 A,SD: 1.862,87.64 ± 3.44 g,SD: 70.17,34.420 ± 0.532 W,SD: 20.672,213.94,28.26 g/A,2.55 g/W
